@@ -1,0 +1,55 @@
+(ns remediationops.phase-test
+  "The phase table as executable tests. The invariant this repo cannot
+  regress on: `:flag-contamination-concern` must NEVER be a member of
+  any phase's `:auto` set."
+  (:require [clojure.test :refer [deftest is testing]]
+            [remediationops.phase :as phase]))
+
+(deftest contamination-concern-never-auto-at-any-phase
+  (testing "structural invariant: no phase, now or in future entries, auto-commits a contamination-concern flag"
+    (doseq [[n {:keys [auto]}] phase/phases]
+      (is (not (contains? auto :flag-contamination-concern))
+          (str "phase " n " must not auto-commit :flag-contamination-concern")))))
+
+(deftest phase-0-is-fully-read-only
+  (is (empty? (:writes (get phase/phases 0)))))
+
+(deftest remediation-logging-enabled-from-phase-1
+  (is (contains? (:writes (get phase/phases 1)) :log-remediation-record))
+  (is (not (contains? (:writes (get phase/phases 0)) :log-remediation-record))))
+
+(deftest operation-and-disposal-enabled-from-phase-2
+  (doseq [op [:schedule-remediation-operation :coordinate-disposal]]
+    (is (contains? (:writes (get phase/phases 2)) op))
+    (is (not (contains? (:writes (get phase/phases 1)) op)))))
+
+(deftest contamination-concern-enabled-only-from-phase-3
+  (is (contains? (:writes (get phase/phases 3)) :flag-contamination-concern))
+  (is (not (contains? (:writes (get phase/phases 2)) :flag-contamination-concern))))
+
+(deftest phase-3-auto-commits-three-of-four-ops
+  (testing ":flag-contamination-concern is the only non-auto-eligible op at phase 3 -- always human sign-off"
+    (is (= #{:log-remediation-record :schedule-remediation-operation :coordinate-disposal}
+           (:auto (get phase/phases 3))))))
+
+(deftest gate-hold-always-wins
+  (is (= :hold (:disposition (phase/gate 3 {:op :log-remediation-record} :hold)))))
+
+(deftest gate-escalate-always-wins-over-auto
+  (testing "the phase gate never downgrades a governor escalate (e.g. contamination-concern) back to commit"
+    (is (= :escalate (:disposition (phase/gate 3 {:op :flag-contamination-concern} :escalate))))))
+
+(deftest gate-escalates-a-clean-non-auto-write
+  (is (= :escalate (:disposition (phase/gate 3 {:op :flag-contamination-concern} :commit)))))
+
+(deftest gate-holds-a-write-disabled-in-this-phase
+  (is (= :hold (:disposition (phase/gate 0 {:op :log-remediation-record} :commit))))
+  (is (= :phase-disabled (:reason (phase/gate 0 {:op :log-remediation-record} :commit)))))
+
+(deftest gate-auto-commits-a-clean-auto-eligible-write-at-phase-3
+  (is (= :commit (:disposition (phase/gate 3 {:op :log-remediation-record} :commit)))))
+
+(deftest verdict->disposition-priority
+  (is (= :hold (phase/verdict->disposition {:hard? true :escalate? false})))
+  (is (= :escalate (phase/verdict->disposition {:hard? false :escalate? true})))
+  (is (= :commit (phase/verdict->disposition {:hard? false :escalate? false}))))

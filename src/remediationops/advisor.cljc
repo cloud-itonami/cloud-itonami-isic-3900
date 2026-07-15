@@ -1,0 +1,199 @@
+(ns remediationops.advisor
+  "RemediationOpsAdvisor -- the *contained intelligence node* for the
+  ISIC-3900 remediation-activities-and-other-waste-management-services
+  operations-coordination actor.
+
+  It drafts exactly four kinds of back-office proposal from a closed
+  allowlist: remediation-record logging (excavation/treatment-volume,
+  contaminant-level sampling data), remediation-operation scheduling
+  (excavation/treatment/monitoring-well work), contamination-concern
+  flagging (contaminant-spread/exposure-risk), and outbound disposal
+  coordination (treated-material/contaminated-soil). CRITICAL: it is a
+  smart-but-untrusted advisor. It returns a *proposal* (with a
+  rationale + the fields it cited), never a committed record and NEVER
+  a direct actuation -- every proposal's `:effect` is always
+  `:propose`. Every output is censored downstream by
+  `remediationops.governor` before anything touches the SSoT.
+
+  This advisor NEVER drafts excavation/treatment-equipment control
+  (direct actuation) or any regulatory site-closure-certification
+  decision (site-closure certification issuance, remediation-
+  completion certification, regulatory closure approval) -- those are
+  permanently out of scope for this actor, not merely un-implemented.
+  `remediationops.governor`'s `scope-exclusion-violations`
+  independently re-scans every proposal for exactly this failure mode
+  (a compromised or confused advisor drifting into scope it must never
+  touch) and HARD-holds it, regardless of confidence or op.
+
+  Like every sibling actor's advisor, this is a deterministic mock so
+  the actor graph runs offline and the governor contract is exercised
+  end-to-end. In production this calls a real LLM (kotoba-llm or
+  equivalent) with the same proposal shape.
+
+  Proposal shape (all kinds):
+    {:op          kw             ; echoes the request op
+     :site-id     str
+     :summary     str            ; human-facing draft / finding
+     :rationale   str            ; why -- SCANNED by the scope-exclusion gate
+     :cites       [str ..]       ; facts/sources the advisor used -- SCANNED too
+     :effect      :propose       ; ALWAYS :propose -- never a direct actuation
+     :value       map            ; the draft payload a human/system would review
+     :confidence  0..1}"
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [clojure.string :as str]
+            [langchain.model :as model]))
+
+(defprotocol Advisor
+  (-advise [advisor store request] "store + request -> proposal map"))
+
+;; ----------------------------- proposal generators -----------------------------
+
+(defn- propose-remediation-record
+  "Draft an excavation/treatment-volume and contaminant-level
+  sampling-data remediation-record log entry. Pure logging of
+  ALREADY-OBSERVED data -- never a decision about excavation or
+  treatment equipment operation."
+  [_db {:keys [site-id patch]}]
+  {:op          :log-remediation-record
+   :site-id     site-id
+   :summary     (str site-id " の浄化記録(掘削量/処理量/汚染物質濃度サンプリングデータ)を提案: " (pr-str (keys patch)))
+   :rationale   "入力された掘削量/処理量/汚染物質濃度サンプリングデータの記録提案のみ。新規事実の生成なし。"
+   :cites       [site-id]
+   :effect      :propose
+   :value       (merge {:site-id site-id} patch)
+   :confidence  0.93})
+
+(defn- propose-remediation-operation
+  "Draft an excavation/treatment/monitoring-well scheduling proposal
+  (a calendar entry/work order draft, never a direct dispatch or
+  equipment actuation)."
+  [_db {:keys [site-id patch]}]
+  {:op          :schedule-remediation-operation
+   :site-id     site-id
+   :summary     (str site-id " の掘削/処理/観測井作業の予定を提案: " (pr-str (keys patch)))
+   :rationale   "掘削・処理・観測井作業のスケジュールの提案のみ。実際の作業実施の判断は人間が行う。"
+   :cites       [site-id]
+   :effect      :propose
+   :value       (merge {:site-id site-id} patch)
+   :confidence  0.88})
+
+(defn- propose-contamination-concern
+  "Surface a contaminant-spread/exposure-risk concern for HUMAN
+  triage. This op ALWAYS escalates in `remediationops.governor` --
+  never auto-committed at any phase (`remediationops.phase`) --
+  regardless of how confident the advisor is that the concern is real
+  or minor. The advisor itself makes NO regulatory-compliance
+  determination; it only surfaces the observation."
+  [_db {:keys [site-id patch]}]
+  {:op          :flag-contamination-concern
+   :site-id     site-id
+   :summary     (str site-id " の汚染上の懸念(汚染拡散/曝露リスク)を提起: " (pr-str (keys patch)))
+   :rationale   "観測された懸念事象の提起のみ。規制コンプライアンス評価・是正措置の決定は行わない -- 常に人間審査が必要。"
+   :cites       [site-id]
+   :effect      :propose
+   :value       (merge {:site-id site-id} patch)
+   :confidence  (get patch :confidence 0.9)})
+
+(defn- propose-disposal
+  "Draft an outbound treated-material/contaminated-soil disposal-site
+  coordination proposal -- scheduling/logistics only, never the
+  underlying transport-permit or regulatory-compliance decision
+  itself."
+  [_db {:keys [site-id patch]}]
+  {:op          :coordinate-disposal
+   :site-id     site-id
+   :summary     (str site-id " の処理済み材料/汚染土壌の処分先搬出調整を提案: " (pr-str (keys patch)))
+   :rationale   "処理済み材料・汚染土壌の処分先搬出物流調整の提案のみ。実際の搬出承認は人間が行う。"
+   :cites       [site-id]
+   :effect      :propose
+   :value       (merge {:site-id site-id} patch)
+   :confidence  0.87})
+
+(defn- propose-out-of-scope
+  "Test/failure-mode hook: drafts a proposal that touches a
+  permanently-excluded scope area (excavation/treatment-equipment
+  control or a regulatory site-closure-certification decision) so the
+  governor's `scope-exclusion-violations` HARD block can be exercised
+  directly, the same 'exercise the failure mode directly' discipline
+  every sibling actor's own sim/test suite uses. Never reachable from
+  the closed op allowlist in normal operation -- only via the
+  `:out-of-scope?` request flag."
+  [_db {:keys [site-id patch]}]
+  {:op          :schedule-remediation-operation
+   :site-id     site-id
+   :summary     (str site-id " の掘削設備制御シーケンスの変更を提案")
+   :rationale   "対象siteのexcavation equipment controlとtreatment plant actuationのタイミングを調整済み"
+   :cites       [site-id]
+   :effect      :propose
+   :value       (merge {:site-id site-id} patch)
+   :confidence  0.9})
+
+(defn infer
+  "Route a request to the right proposal generator.
+  request: {:op kw :site-id str :patch map ...}"
+  [db {:keys [op out-of-scope?] :as request}]
+  (cond
+    out-of-scope?                        (propose-out-of-scope db request)
+    (= op :log-remediation-record)       (propose-remediation-record db request)
+    (= op :schedule-remediation-operation) (propose-remediation-operation db request)
+    (= op :flag-contamination-concern)   (propose-contamination-concern db request)
+    (= op :coordinate-disposal)          (propose-disposal db request)
+    :else {:op op :site-id (:site-id request)
+           :summary "未対応の操作" :rationale (str "closed allowlist に無い操作: " op)
+           :cites [] :effect :propose :value {} :confidence 0.0}))
+
+(defn mock-advisor
+  "The deterministic advisor (the `infer` logic above). Default everywhere."
+  [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+;; ----------------------------- real-LLM advisor (production seam) -----------------------------
+
+(def ^:private system-prompt
+  (str "あなたは汚染サイト浄化(remediation)事業の運営コーディネーション助言者です。"
+       "与えられた事実のみに基づき、提案を1つだけEDNマップで返します。"
+       "許可された操作は :log-remediation-record / :schedule-remediation-operation / "
+       ":flag-contamination-concern / :coordinate-disposal の4つのみです。"
+       "掘削・処理設備の直接制御や、規制当局のサイト閉鎖認証の判断"
+       "(サイト閉鎖認証発行/浄化完了認証/規制閉鎖承認)には絶対に触れてはいけません。"
+       "キー: :op :site-id :summary :rationale :cites :effect(常に :propose) "
+       ":value :confidence(0..1)。"))
+
+(defn- parse-proposal
+  "Parse the model's EDN proposal defensively. Any parse/shape failure
+  yields a safe low-confidence noop so the governor escalates/holds --
+  an LLM hiccup can never bypass governance."
+  [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p
+          (update :cites #(vec (or % [])))
+          (update :confidence #(if (number? %) (double %) 0.0))
+          (update :effect #(or % :propose)))
+      {:summary "LLM応答を解釈できませんでした" :rationale (str content)
+       :cites [] :effect :propose :value {} :confidence 0.0})))
+
+(defn llm-advisor
+  "An advisor backed by a `langchain.model/ChatModel` (real inference)."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ _st req]
+       (let [msgs [{:role :system :content system-prompt}
+                   {:role :user :content (str "操作: " (:op req)
+                                              "\n site: " (:site-id req)
+                                              "\n patch: " (pr-str (:patch req)))}]
+             resp (model/-generate chat-model msgs gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace
+  "Decision-grounded audit record -- persisted to the :audit channel."
+  [request proposal]
+  {:t          :advisor-proposal
+   :op         (:op request)
+   :site-id    (:site-id request)
+   :summary    (:summary proposal)
+   :rationale  (:rationale proposal)
+   :cites      (:cites proposal)
+   :confidence (:confidence proposal)})

@@ -1,0 +1,53 @@
+(ns remediationops.advisor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [remediationops.advisor :as advisor]
+            [remediationops.store :as store]))
+
+(def db (store/seed-db))
+
+(deftest every-op-proposal-is-always-propose-effect
+  (testing "the advisor NEVER drafts a direct-actuation :effect -- always :propose"
+    (doseq [op [:log-remediation-record :schedule-remediation-operation :flag-contamination-concern :coordinate-disposal]]
+      (let [p (advisor/infer db {:op op :site-id "brownfield-site-1" :patch {}})]
+        (is (= :propose (:effect p)) (str op " must always propose, never actuate"))
+        (is (= op (:op p)))
+        (is (= "brownfield-site-1" (:site-id p)))
+        (is (<= 0.0 (:confidence p) 1.0))
+        (is (seq (:cites p)))))))
+
+(deftest unrecognized-op-is-a-safe-noop
+  (testing "an op outside the closed allowlist yields a safe zero-confidence :propose noop -- never a fabricated actuation"
+    (let [p (advisor/infer db {:op :operate-excavator :site-id "brownfield-site-1" :patch {}})]
+      (is (= :propose (:effect p)))
+      (is (zero? (:confidence p))))))
+
+(deftest contamination-concern-confidence-passes-through-patch
+  (testing "a caller-supplied confidence on a contamination-concern proposal is honored (the governor, not the advisor, is what always escalates this op)"
+    (let [p (advisor/infer db {:op :flag-contamination-concern :site-id "brownfield-site-1" :patch {:concern "contamination" :confidence 0.99}})]
+      (is (= 0.99 (:confidence p))))))
+
+(deftest disposal-proposal-carries-destination
+  (testing "a patch's :destination flows through to the proposal's :value"
+    (let [p (advisor/infer db {:op :coordinate-disposal :site-id "brownfield-site-1"
+                               :patch {:material "treated-soil" :destination "licensed-disposal-facility-a"}})]
+      (is (= "licensed-disposal-facility-a" (get-in p [:value :destination]))))))
+
+(deftest out-of-scope-hook-drafts-a-detectably-poisoned-proposal
+  (testing "the :out-of-scope? test hook drafts content the governor's scope-exclusion scan must catch -- proves the failure mode is real and testable end to end"
+    (let [p (advisor/infer db {:op :schedule-remediation-operation :site-id "brownfield-site-1" :patch {} :out-of-scope? true})]
+      (is (= :propose (:effect p)))
+      (is (re-find #"(?i)excavation equipment control" (str (:summary p) (:rationale p)))))))
+
+(deftest mock-advisor-routes-through-infer
+  (let [a (advisor/mock-advisor)
+        p (advisor/-advise a db {:op :coordinate-disposal :site-id "brownfield-site-1" :patch {:material "treated-soil"}})]
+    (is (= :coordinate-disposal (:op p)))
+    (is (= :propose (:effect p)))))
+
+(deftest trace-carries-decision-grounded-fields
+  (let [request {:op :log-remediation-record :site-id "brownfield-site-1"}
+        proposal (advisor/infer db request)
+        t (advisor/trace request proposal)]
+    (is (= :log-remediation-record (:op t)))
+    (is (= "brownfield-site-1" (:site-id t)))
+    (is (= (:confidence proposal) (:confidence t)))))
