@@ -1,0 +1,264 @@
+(ns remediationops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300,
+  Wave3 rollout ledger): this repo previously had NO demo page generator
+  and no `render_html` at all. This namespace drives the REAL actor stack
+  (`remediationops.operation` -> `remediationops.governor` ->
+  `remediationops.store`) through a scenario adapted from this repo's
+  own `remediationops.sim` demo driver (`clojure -M:run`, confirmed to
+  run against the real seeded site directory before this file was
+  written -- site ids brownfield-site-1 / groundwater-site-2 /
+  closure-site-3 DO match `remediationops.store/demo-data`, and the
+  `:commit` node genuinely calls `store/commit-record!` so the
+  coordination log grows by one real entry per committed op), trimmed
+  to a representative subset (three clean phase-3 auto-commits across
+  two sites, the ALWAYS-escalate contamination-concern lifecycle
+  approved by a human remediation-project supervisor, and four distinct
+  HARD-hold reasons that never reach a human) and rendered
+  deterministically -- no invented numbers, no timestamps in the page
+  content, byte-identical across reruns against the same seed (verify
+  by diffing two consecutive runs).
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [remediationops.store :as store]
+            [remediationops.advisor :as advisor]
+            [remediationops.operation :as op]
+            [langgraph.graph :as g]))
+
+;; ----------------------------- harness --------------------------------
+
+(def ^:private operator
+  {:actor-id "op-1" :actor-role :remediation-project-supervisor :phase 3})
+
+(defn- exec! [actor tid request]
+  (g/run* actor {:request request :context operator} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn run-demo!
+  "Runs a fresh seeded store through a scenario mixing every disposition
+  this actor can reach, using ONLY real site ids from
+  `remediationops.store/demo-data` and real op keywords from
+  `remediationops.governor/allowed-ops`:
+
+  brownfield-site-1 and groundwater-site-2 (both registered AND
+  verified) walk the clean phase-3 auto-commit path:
+  `:log-remediation-record` (excavation/treatment-volume logging),
+  `:schedule-remediation-operation` (monitoring-well sampling schedule)
+  and `:coordinate-disposal` (treated-soil outbound coordination) are
+  all governor-clean, high-confidence, and members of phase 3's `:auto`
+  set -- they auto-commit with no human in the loop. brownfield-site-1
+  also flags a `:flag-contamination-concern` (groundwater plume
+  migration) -- this op is ALWAYS in `governor/always-escalate-ops` and
+  is deliberately absent from every phase's `:auto` set
+  (`remediationops.phase`), so it escalates regardless of phase or
+  confidence and is approved by a human remediation-project supervisor.
+
+  Then four DISTINCT HARD-hold reasons, none of which ever reach a
+  human (a human approver cannot override a HARD violation):
+    - brownfield-site-9 (not in the seed directory at all):
+      `:log-remediation-record` HARD-holds on `:site-unverified` -- the
+      governor independently re-derives registration/verification from
+      the site's own store record, never from the proposal's
+      self-reported site-id.
+    - closure-site-3 (seeded `:registered? true :verified? false` --
+      Old Millworks Site, closure verification lapsed):
+      `:log-remediation-record` HARD-holds on `:site-unverified`.
+    - brownfield-site-1, advisor attempts direct actuation (`:effect
+      :commit` instead of `:propose`): `:coordinate-disposal` HARD-
+      holds on `:effect-not-propose`.
+    - brownfield-site-1, advisor drifts into the permanently-excluded
+      excavation-equipment-control / site-closure-certification scope
+      (`:out-of-scope?` flag on the request, the same failure-mode hook
+      `remediationops.sim` exercises): `:schedule-remediation-operation`
+      HARD-holds on `:scope-excluded` -- this actor's charter
+      structurally excludes that territory, evaluated unconditionally
+      on every proposal regardless of op or confidence.
+
+  Returns the resulting store -- every field `render` below reads is
+  real governor/store output, not a hand-typed copy."
+  []
+  (let [db (store/seed-db)
+        actor (op/build db)]
+
+    ;; brownfield-site-1: clean excavation-volume logging -- phase-3
+    ;; auto-commit.
+    (exec! actor "s1-log" {:op :log-remediation-record :site-id "brownfield-site-1"
+                            :patch {:excavated-tons 45.1 :shift "night"}})
+
+    ;; groundwater-site-2: clean monitoring-well sampling schedule --
+    ;; phase-3 auto-commit.
+    (exec! actor "s2-schedule" {:op :schedule-remediation-operation :site-id "groundwater-site-2"
+                                 :patch {:operation "monitoring-well-sampling-4"
+                                         :window "2026-07-22"}})
+
+    ;; groundwater-site-2: clean treated-soil disposal coordination --
+    ;; phase-3 auto-commit.
+    (exec! actor "s2-disposal" {:op :coordinate-disposal :site-id "groundwater-site-2"
+                                 :patch {:material "treated-soil"
+                                         :destination "licensed-disposal-facility-a"}})
+
+    ;; brownfield-site-1: contamination-concern flag (groundwater plume
+    ;; migration) -- ALWAYS escalates, approved by a human
+    ;; remediation-project supervisor.
+    (exec! actor "s1-concern" {:op :flag-contamination-concern :site-id "brownfield-site-1"
+                                :patch {:concern "groundwater plume migration observed"
+                                        :confidence 0.95}})
+    (approve! actor "s1-concern")
+
+    ;; brownfield-site-9: unregistered (not in seed) -> HARD hold on
+    ;; :site-unverified, never reaches a human.
+    (exec! actor "s9-log" {:op :log-remediation-record :site-id "brownfield-site-9"
+                            :patch {:excavated-tons 0.1}})
+
+    ;; closure-site-3: registered but NOT verified (closure verification
+    ;; lapsed) -> HARD hold on :site-unverified, never reaches a human.
+    (exec! actor "s3-log" {:op :log-remediation-record :site-id "closure-site-3"
+                            :patch {:excavated-tons 0.1}})
+
+    ;; brownfield-site-1: advisor attempts direct actuation (:effect
+    ;; :commit instead of :propose) -> HARD hold on
+    ;; :effect-not-propose, never reaches a human.
+    (let [actor-direct (op/build db {:advisor (reify advisor/Advisor
+                                                 (-advise [_ _ req]
+                                                   (assoc (advisor/infer db req) :effect :commit)))})]
+      (exec! actor-direct "s1-effect" {:op :coordinate-disposal :site-id "brownfield-site-1"
+                                        :patch {:material "recovered-soil"}}))
+
+    ;; brownfield-site-1: advisor drifts into excavation-equipment-
+    ;; control / site-closure-certification scope -> HARD hold on
+    ;; :scope-excluded, permanent, never reaches a human.
+    (exec! actor "s1-scope" {:op :schedule-remediation-operation :site-id "brownfield-site-1"
+                              :out-of-scope? true :patch {}})
+
+    db))
+
+;; ----------------------------- rendering ------------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- last-fact-for [ledger site-id]
+  (last (filter #(= (:site-id %) site-id) ledger)))
+
+(defn- status-cell [ledger site-id]
+  (let [f (last-fact-for ledger site-id)]
+    (cond
+      (nil? f) "<span class=\"muted\">no activity</span>"
+      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
+      (= :approval-granted (:t f)) "<span class=\"ok\">approved &amp; committed</span>"
+      (= :governor-hold (:t f))
+      (let [rule (-> f :violations first :rule)]
+        (str "<span class=\"critical\">HARD hold &middot; " (esc (name (or rule :unknown))) "</span>"))
+      (= :approval-requested (:t f)) "<span class=\"warn\">awaiting approval</span>"
+      (= :approval-rejected (:t f)) "<span class=\"critical\">approval rejected</span>"
+      :else "<span class=\"muted\">in progress</span>")))
+
+(defn- site-row [ledger {:keys [site-id name registered? verified?]}]
+  (format "        <tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc site-id) (esc name)
+          (if registered? "<span class=\"ok\">registered</span>" "<span class=\"critical\">unregistered</span>")
+          (if verified? "<span class=\"ok\">verified</span>" "<span class=\"critical\">unverified</span>")
+          (status-cell ledger site-id)))
+
+(defn- ledger-row [{:keys [t op site-id disposition basis]}]
+  (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          (esc (name t)) (esc (name (or op :n-a))) (esc site-id)
+          (esc (or (some->> basis (map #(if (keyword? %) (name %) (str %))) (str/join ", "))
+                    (some-> disposition name) ""))))
+
+(defn- coord-row [{:keys [op site-id value payload]}]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          (esc (name (or op :n-a))) (esc site-id)
+          (esc (pr-str (or payload value {})))))
+
+(def ^:private action-gate-rows
+  ;; Static description of this actor's own closed op contract (README
+  ;; Ops, remediationops.governor / .phase) -- documentation of fixed
+  ;; behavior, not runtime telemetry.
+  ["        <tr><td><code>:log-remediation-record</code></td><td><span class=\"ok\">phase-3 auto when clean</span> &middot; HARD hold if site unverified</td></tr>"
+   "        <tr><td><code>:schedule-remediation-operation</code></td><td><span class=\"ok\">phase-3 auto when clean</span> &middot; HARD hold if site unverified or effect not :propose or scope-excluded</td></tr>"
+   "        <tr><td><code>:coordinate-disposal</code></td><td><span class=\"ok\">phase-3 auto when clean</span> &middot; :effect independently re-checked as :propose on every proposal</td></tr>"
+   "        <tr><td><code>:flag-contamination-concern</code></td><td><span class=\"warn\">ALWAYS human approval &middot; never auto, any phase</span> &middot; observation only; excavation/treatment-equipment control and regulatory site-closure certification are permanently out of scope</td></tr>"])
+
+(defn render
+  "Renders the full operator-console.html document from a store `db`
+  that has already run `run-demo!` (or any other real scenario)."
+  [db]
+  (let [ledger (vec (store/ledger db))
+        sites (store/all-sites db)
+        coords (store/coordination-log db)
+        site-rows (str/join "\n" (map (partial site-row ledger) sites))
+        coord-rows (str/join "\n" (map coord-row coords))
+        ledger-rows (str/join "\n" (map ledger-row ledger))]
+    (str
+     "<html><head><meta charset=\"utf-8\"><title>cloud-itonami-isic-3900 &middot; remediation activities and other waste management services</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Remediation activities and other waste management services (ISIC 3900) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · never actuates excavation/treatment equipment or issues site-closure certification</span>\n"
+     "</header>\n"
+     "<main>\n"
+     "  <section class=\"card\">\n"
+     "    <h2>Contaminated-site remediation programs</h2>\n"
+     "    <p class=\"muted\">Demo snapshot — build-time-generated from <code>remediationops.store</code> via <code>remediationops.render-html</code> (<code>clojure -M:dev:render-html</code>), regenerated from the real actor stack.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Site</th><th>Name</th><th>Registration</th><th>Verification</th><th>Last coordination status</th></tr></thead>\n"
+     "      <tbody>\n"
+     site-rows "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "  <section class=\"card\">\n"
+     "    <h2>Committed coordination log</h2>\n"
+     "    <p class=\"muted\">Proposals that actually committed to the SSoT (auto-commit or human-approved). HARD holds never appear here.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Site</th><th>Value</th></tr></thead>\n"
+     "      <tbody>\n"
+     coord-rows "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate (SiteRemediationOpsGovernor)</h2>\n"
+     "    <p class=\"muted\">HARD holds cannot be overridden. Site registration/verification is independently re-derived from the store; <code>:effect</code> must be <code>:propose</code>; excavation/treatment-equipment control and regulatory site-closure-certification decisions are permanently out of scope.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Gate</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" action-gate-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">Append-only decision-fact log — every proposal, hold and commit this scenario produced.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Site</th><th>Basis</th></tr></thead>\n"
+     "      <tbody>\n"
+     ledger-rows "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+     "</main>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        parent (.getParentFile (java.io.File. out))]
+    (when (and parent (not (.exists parent)))
+      (.mkdirs parent))
+    (let [db (run-demo!)
+          html (render db)]
+      (spit out html)
+      (println "wrote" out "(" (count (store/ledger db)) "ledger facts,"
+               (count (store/coordination-log db)) "committed coordination records )"))))
