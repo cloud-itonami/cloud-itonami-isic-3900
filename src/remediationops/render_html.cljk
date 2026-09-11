@@ -6,7 +6,7 @@
   and no `render_html` at all. This namespace drives the REAL actor stack
   (`remediationops.operation` -> `remediationops.governor` ->
   `remediationops.store`) through a scenario adapted from this repo's
-  own `remediationops.sim` demo driver (`clojure -M:run`, confirmed to
+  own `remediationops.sim` demo driver (`kbb -M:run`, confirmed to
   run against the real seeded site directory before this file was
   written -- site ids brownfield-site-1 / groundwater-site-2 /
   closure-site-3 DO match `remediationops.store/demo-data`, and the
@@ -20,7 +20,7 @@
   content, byte-identical across reruns against the same seed (verify
   by diffing two consecutive runs).
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
             [kotoba.lang.text :as str]
@@ -211,7 +211,7 @@
      "<main>\n"
      "  <section class=\"card\">\n"
      "    <h2>Contaminated-site remediation programs</h2>\n"
-     "    <p class=\"muted\">Demo snapshot — build-time-generated from <code>remediationops.store</code> via <code>remediationops.render-html</code> (<code>clojure -M:dev:render-html</code>), regenerated from the real actor stack.</p>\n"
+     "    <p class=\"muted\">Demo snapshot — build-time-generated from <code>remediationops.store</code> via <code>remediationops.render-html</code> (<code>kbb -M:dev:render-html</code>), regenerated from the real actor stack.</p>\n"
      "    <table>\n"
      "      <thead><tr><th>Site</th><th>Name</th><th>Registration</th><th>Verification</th><th>Last coordination status</th></tr></thead>\n"
      "      <tbody>\n"
